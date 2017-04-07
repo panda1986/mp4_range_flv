@@ -11,7 +11,7 @@ package mp4
         
         public function MP4()
         {
-            _mux = new Muxer()
+            _mux = new Muxer()    
         }
         
         public function parse_moov_size(data:ByteArray):void {
@@ -58,8 +58,23 @@ package mp4
                     break;
                 }
             }
-            return
-                
+            return    
+        }
+        
+        public function parse_sequence_header():ByteArray {
+            return _mux.parse_sequence_header()    
+        }
+        
+        public function parse_piece_range(piece_id:uint):Object {
+            return _mux.dec.parse_piece_range(piece_id)
+        }
+        
+        public function parse_piece(data:ByteArray, start_sid:uint, end_sid:uint):ByteArray {
+            return _mux.parse_piece(data, start_sid, end_sid);
+        }
+        
+        public function get_sample_offset(id:uint):uint {
+            return _mux.dec.samples.get_offset(id)
         }
     }
 }
@@ -74,7 +89,7 @@ class SrsFlvTag {
 }
 
 class Muxer {
-    private var dec:Decoder
+    public var dec:Decoder
     
     public function Muxer() {
         dec = new Decoder()
@@ -82,6 +97,74 @@ class Muxer {
     
     public function mux():void {
         
+    }
+    
+    public function parse_piece(data:ByteArray, start_sid:uint, end_sid:uint):ByteArray {
+        data.position = 0;
+        var res:ByteArray = new ByteArray()
+        var relative_offset:uint = dec.samples.get_offset(start_sid);    
+        for (var i:uint = start_sid; i < end_sid; i++) {
+            var s:SrsMp4Sample = dec.read_sample(i, data, relative_offset);
+            if (s) {
+                var t:SrsFlvTag = sample_to_tag(s)
+                this.write_flv_tag(res, t)
+            }
+        }
+        
+        return res
+    }
+    
+    public function parse_sequence_header():ByteArray {
+        var sh:ByteArray = new ByteArray()
+        // FLV Header    
+        sh.writeUTFBytes("FLV")
+        sh.writeByte(1)
+        
+        var flag:int = 0
+        if (dec.acodec != 0) {
+            flag = flag | 0x04
+        }
+        if (dec.vcodec != 0) {
+            flag = flag | 0x01
+        }
+        sh.writeByte(flag)
+        
+        var dataOffset:uint = 9
+        sh.writeUnsignedInt(dataOffset)
+        sh.writeUnsignedInt(0)    // first prev tag size
+        
+        // FLV metadata tag, type=18
+        sh.writeByte(18)
+        
+        // datasize 3 bytes    
+        var meta:ByteArray = encode_metadata()
+        this.write_3_bytes(sh, meta.length)
+        // timestamp 4 bytes    
+        sh.writeUnsignedInt(0)
+        // streamId 3 bytes    
+        this.write_3_bytes(sh, 0)
+        // write meta
+        sh.writeBytes(meta)
+        // prev tag size    
+        sh.writeUnsignedInt(meta.length + 11)  
+            
+        // video sh
+        var s:SrsMp4Sample = dec.read_video_sh_sample()
+        if (!s) {
+            trace("have no video sh")
+            return sh
+        }
+        var t:SrsFlvTag = sample_to_tag(s)    
+        this.write_flv_tag(sh, t)    
+        // audio sh 
+        s = dec.read_audio_sh_sample()
+        if (!s) {
+            trace("have no audio sh")
+            return sh
+        }
+        t = sample_to_tag(s)    
+        this.write_flv_tag(sh, t)     
+        return sh    
     }
     
     public function parse_moov(moov:MoovBox):void {
@@ -164,6 +247,57 @@ class Muxer {
                 return 16
         }
         return 0
+    }
+    
+    private function write_flv_tag(flv:ByteArray, t:SrsFlvTag):void {
+        flv.writeByte(t.tag_type)
+        this.write_3_bytes(flv, t.data.length)
+        this.write_3_bytes(flv, t.time)
+        flv.writeByte(0)
+        this.write_3_bytes(flv, 0)
+        flv.writeBytes(t.data)  
+        flv.writeUnsignedInt(t.data.length + 11)
+    }
+    
+    private function sample_to_tag(s:SrsMp4Sample):SrsFlvTag {
+        var tag:SrsFlvTag = new SrsFlvTag()
+        
+        tag.time = s.dts
+        if (s.handler_type == BaseMP4.SrsMp4HandlerTypeSOUN) {
+            tag.tag_type = BaseMP4.SRS_RTMP_TYPE_AUDIO
+            // E.4.2.1 AUDIODATA, flv_v10_1.pdf, page 3
+            var tmp:uint = s.codec << 4 | s.sample_rate << 2 | s.sound_bits << 1 | s.channels  
+            tag.data.writeByte(tmp) 
+            
+            if (s.codec == BaseMP4.SrsAudioCodecIdAAC) {
+                if (s.frame_trait == BaseMP4.SrsAudioAacFrameTraitSequenceHeader) {
+                    tag.data.writeByte(0)
+                } else {
+                    tag.data.writeByte(1)
+                }
+            }
+            tag.data.writeBytes(s.sample)
+            return tag    
+        }
+        
+        // E.4.3.1 VIDEODATA, flv_v10_1.pdf, page 5
+        tmp = s.frame_ype << 4 | s.codec
+        tag.data.writeByte(tmp)
+        if (s.codec == BaseMP4.SrsVideoCodecIdAVC) {
+            tag.tag_type = BaseMP4.SRS_RTMP_TYPE_VIDEO
+            if (s.frame_trait == BaseMP4.SrsVideoAvcFrameTraitSequenceHeader) {
+                tag.data.writeByte(0)
+            } else {
+                tag.data.writeByte(1)
+            }
+            
+            // cts = pts - dts, where dts = flvheader->timestamp.
+            var cts:int = s.pts - s.dts // TODO: may be cts = (s.pts - s.dts) /90;
+            this.write_3_bytes(tag.data, cts)   
+        }
+        tag.data.writeBytes(s.sample)
+        tag.data.position = 0    
+        return tag
     }
 }
 
@@ -255,6 +389,20 @@ class Decoder {
         samples = new Mp4SampleManager()
     }
     
+    public function parse_piece_range(piece_id:uint):Object {
+        var obj:Object = {};
+        // check if piece time exceed duration
+        var st_ms:uint = piece_id * Mp4RangeFlv.PerPieceSeconds * 1000;
+        var end_ms:uint = (piece_id + 1) * Mp4RangeFlv.PerPieceSeconds * 1000;
+        if (st_ms >= this.duration) {
+            return obj;
+        }
+        if (end_ms >= this.duration) {
+            end_ms = this.duration;
+        }
+        return this.samples.parse_sample_range(st_ms, end_ms);
+    }
+    
     public function parse_moov(moov:MoovBox):void {
         var mvhd:MvhdBox = moov.Mvhd
         if (!mvhd) {
@@ -331,7 +479,7 @@ class Decoder {
         trace("dur=", duration, "vide=", vcodec, moov.NbVideoTracks, "soun=", acodec, moov.NbAudioTracks, sample_rate, sample_size, channels, width, height)
     }
     
-    private function read_sample(mp4_file:ByteArray):SrsMp4Sample {
+    public function read_video_sh_sample():SrsMp4Sample {
         var s:SrsMp4Sample = new SrsMp4Sample()
         if (!this.avccWritten && this.pavcc.length != 0) {
             this.avccWritten = true
@@ -342,10 +490,16 @@ class Decoder {
             s.sample.position = 0
             s.frame_ype = BaseMP4.SrsVideoAvcFrameTypeKeyFrame
             s.frame_trait = BaseMP4.SrsVideoAvcFrameTraitSequenceHeader
+                
+            s.codec = this.vcodec
             trace("make a video sh") 
             return s
         }
-        
+        return null
+    }
+    
+    public function read_audio_sh_sample():SrsMp4Sample {
+        var s:SrsMp4Sample = new SrsMp4Sample()
         if (!this.ascWritten && this.pasc.length != 0) {
             this.ascWritten = true
             s.handler_type = BaseMP4.SrsMp4HandlerTypeSOUN
@@ -355,10 +509,51 @@ class Decoder {
             s.sample.position = 0
             s.frame_ype = 0
             s.frame_trait = BaseMP4.SrsAudioAacFrameTraitSequenceHeader  
+                
+            s.codec = this.acodec
+            s.sample_rate = this.sample_rate
+            s.channels = this.channels
+            s.sound_bits = this.sample_size
             trace("make a audio sh") 
             return s
         }
+        return null
+    }
+    
+    public function read_sample(index:uint, source:ByteArray, relative_offset:uint):SrsMp4Sample {
+        var s:SrsMp4Sample = new SrsMp4Sample()
+        if (index >= this.samples.samples.length) {
+            trace("sample reach end")
+            return null
+        }
         
+        var ms:Mp4Sample = this.samples.samples[index]
+        if (ms.sample_type == BaseMP4.SrsFrameTypeVideo) {
+            s.handler_type = BaseMP4.SrsMp4HandlerTypeVIDE
+            s.frame_trait = BaseMP4.SrsVideoAvcFrameTraitNALU
+            s.codec = this.vcodec
+        } else {
+            s.handler_type = BaseMP4.SrsMp4HandlerTypeSOUN
+            s.frame_trait = BaseMP4.SrsAudioAacFrameTraitRawData 
+            
+            s.codec = this.acodec
+            s.sample_rate = this.sample_rate
+            s.channels = this.channels
+            s.sound_bits = this.sample_size    
+        }
+        s.dts = ms.dts_ms
+        s.pts = ms.pts_ms
+        s.frame_ype = ms.frame_type
+        s.nb_sample = ms.nb_data
+            
+        //trace("read sample, ms offset=", ms.offset, "len=", ms.nb_data, "relative=", relative_offset, "source available=", source.bytesAvailable);
+        s.sample.writeBytes(source, ms.offset - relative_offset, ms.nb_data)
+        s.sample.position = 0    
+        return s
+    }
+    
+    /*private function read_sample(mp4_file:ByteArray):SrsMp4Sample {
+        var s:SrsMp4Sample = new SrsMp4Sample()        
         this.curIndex ++
         if(this.curIndex >= this.samples.samples.length) {
             trace("sample reach end")
@@ -369,9 +564,15 @@ class Decoder {
         if (ms.sample_type == BaseMP4.SrsFrameTypeVideo) {
             s.handler_type = BaseMP4.SrsMp4HandlerTypeVIDE
             s.frame_trait = BaseMP4.SrsVideoAvcFrameTraitNALU
+            s.codec = this.vcodec
         } else {
             s.handler_type = BaseMP4.SrsMp4HandlerTypeSOUN
-            s.frame_trait = BaseMP4.SrsAudioAacFrameTraitRawData  
+            s.frame_trait = BaseMP4.SrsAudioAacFrameTraitRawData 
+                
+            s.codec = this.acodec
+            s.sample_rate = this.sample_rate
+            s.channels = this.channels
+            s.sound_bits = this.sample_size    
         }
         s.dts = ms.dts_ms
         s.pts = ms.pts_ms
@@ -380,7 +581,7 @@ class Decoder {
         s.sample.writeBytes(mp4_file, ms.offset, ms.nb_data)
         s.sample.position = 0    
         return s
-    }
+    }*/
 }
 
 class Mp4SampleManager {
@@ -581,6 +782,37 @@ class Mp4SampleManager {
             samples.push(item)
         })
         return    
+    }
+
+    public function parse_sample_range(st_ms:uint, end_ms:uint):Object {
+        var off:Object = {
+            st_sid: -1,
+            end_sid: -1
+        };
+           
+        trace(".............parse sample range, st_ms=", st_ms, "end_ms=", end_ms, "max=", samples[samples.length - 1].dts_ms);
+        for (var i:uint = 0; i < samples.length; i++) {
+            var s:Mp4Sample = samples[i];
+            if (off.st_sid == -1 && s.dts_ms >= st_ms) {
+                off.st_sid = i;
+            }
+            if (off.end_sid == -1 && s.dts_ms >= end_ms) {
+                off.end_sid = i;
+            }
+        }
+        
+        if (off.end_sid <= off.st_sid) {
+            return {};
+        }
+        trace(".............st_sid=", off.st_sid, "end_sid=", off.end_sid);
+        return off    
+    }
+    
+    public function get_offset(sample_id:uint):uint {
+        if (sample_id >= samples.length) {
+            return samples.length - 1;
+        }
+        return samples[sample_id].offset
     }
 }
 

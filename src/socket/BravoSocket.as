@@ -35,6 +35,8 @@ package socket
         private var _byte_total:uint;
         private var _byte_start:uint;
         private var _byte_end:uint;
+        private var _byte_required:uint;
+        
         private var _http_code:int;
         
         public static const Evt_SocketloadDone:String = "Evt_SocketloadDone";
@@ -101,6 +103,7 @@ package socket
             this._tmp_byte_array.clear();
             this._http_status = null;
             this._http_code = -1;
+            this._byte_required = end - start + 1;
             
             try{
                 //这个是最重要的
@@ -134,7 +137,7 @@ package socket
         }
         
         private function socketDataHandler(event:ProgressEvent):void {
-            trace("socketDataHandler: " + event, event);
+            //trace("socketDataHandler: " + event, event);
             this._socket.readBytes(this._tmp_byte_array, 0, event.bytesLoaded);
             
             //如果还未发现完整的http header 信息
@@ -213,12 +216,15 @@ package socket
                 
                 if(this._http_code == -1 && array && uint(array[1]) > 0){
                     this._http_code = uint(array[1]);
-                    this.dispatchEvent(new Event(Evt_SocketloadDone));
                 }
             } else{
                 this._body_byte_array.position = this._body_byte_array.length;
                 this._body_byte_array.writeBytes(this._tmp_byte_array);
                 this._tmp_byte_array.clear();
+            }
+            
+            if (this._body_byte_array.length >= this._byte_required) {
+                this.dispatchEvent(new Event(Evt_SocketloadDone));
             }
         }
         
@@ -228,14 +234,6 @@ package socket
         
         public function get total():uint {
             return this._byte_total;
-        }
-        
-        public function get start():uint {
-            return this._byte_start;
-        }
-        
-        public function get end():uint {
-            return this._byte_end;
         }
     }
 }
